@@ -45,13 +45,13 @@ data/
 ### Basic Training
 ```bash
 # For CPU
-python train_recsys.py --device=cpu --batch_size=32 --block_size=50
+python train.py --device=cpu --batch_size=32 --block_size=50
 
 # For GPU
-python train_recsys.py --device=cuda --batch_size=32 --block_size=50
+python train.py --device=cuda --batch_size=32 --block_size=50
 
-# For Mac M1/M2/M3
-python train_recsys.py --device=mps --batch_size=32 --block_size=50
+# For Mac M1/M2/M3/M4
+python train.py --device=mps --batch_size=32 --block_size=50
 ```
 
 ### Configuration Parameters

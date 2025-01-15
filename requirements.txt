@@ -7,5 +7,6 @@ tqdm>=4.65.0
 wandb>=0.15.0  # Optional: for experiment tracking
 matplotlib>=3.7.0  # Optional: for visualizations
 
+
 # For M1/M2/M3 Macs, PyTorch will automatically use MPS (Metal Performance Shaders)
 # No need to specify CUDA versions since we're using the native Apple Silicon support 

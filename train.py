@@ -17,6 +17,7 @@ from sklearn.model_selection import train_test_split
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 from model import ProductGPT, ProductGPTConfig
 
@@ -226,7 +227,9 @@ def evaluate(model, val_loader, ctx):
     total_ndcg = 0
     n_batches = 0
 
-    for batch in val_loader:
+    # Add progress bar for evaluation
+    progress = tqdm(val_loader, desc="Evaluating", leave=False)
+    for batch in progress:
         # Move batch to device
         batch = {k: v.to(device) for k, v in batch.items()}
 
@@ -256,6 +259,15 @@ def evaluate(model, val_loader, ctx):
         total_hits += hits.item()
         total_ndcg += ndcg.item()
         n_batches += 1
+
+        # Update progress bar with current metrics
+        progress.set_postfix(
+            {
+                "loss": f"{loss.item():.4f}",
+                "hits": f"{hits.item():.4f}",
+                "ndcg": f"{ndcg.item():.4f}",
+            }
+        )
 
     model.train()
     return {
@@ -315,7 +327,8 @@ def main():
 
     # Training loop
     best_val_loss = float("inf")
-    for iter_num in range(max_iters):
+    progress_bar = tqdm(range(max_iters), desc="Training")
+    for iter_num in progress_bar:
         t0 = time.time()
 
         # Get batch and train
@@ -338,11 +351,10 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-        # Logging
-        if iter_num % log_interval == 0:
-            logging.debug(
-                f"iter {iter_num}: loss {loss.item():.4f}, time {(time.time()-t0)*1000:.2f}ms"
-            )
+        # Update progress bar with current metrics
+        progress_bar.set_postfix(
+            {"loss": f"{loss.item():.4f}", "iter/s": f"{1.0/((time.time()-t0)):.1f}"}
+        )
 
         # Evaluation
         if iter_num % eval_interval == 0:
