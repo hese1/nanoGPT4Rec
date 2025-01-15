@@ -144,28 +144,6 @@ class GPTConfig:
     bias: bool = True
 
 
-@dataclass
-class ProductGPTConfig(GPTConfig):
-    # Original GPT parameters
-    block_size: int = 1024
-    vocab_size: int = None  # Not needed for product recommendations
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True
-
-    # ProductGPT specific parameters
-    n_user_features: int = 64
-    n_product_features: int = 128
-    max_products: int = 100000  # This replaces vocab_size for our use case
-    max_users: int = 1000000
-    n_context_features: int = 5
-    n_user_metadata: int = 23
-    pad_token: int = 0
-    anonymous_user_token: int = -1  # Special token for unknown users
-
-
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -177,9 +155,13 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.vocab_size, config.n_embd),  # token embeddings
-                wpe=nn.Embedding(config.block_size, config.n_embd),  # position embeddings (learned encoding)
+                wpe=nn.Embedding(
+                    config.block_size, config.n_embd
+                ),  # position embeddings (learned encoding)
                 drop=nn.Dropout(config.dropout),
-                h=nn.ModuleList([TransformerBlock(config) for _ in range(config.n_layer)]),
+                h=nn.ModuleList(
+                    [TransformerBlock(config) for _ in range(config.n_layer)]
+                ),
                 ln_f=LayerNorm(config.n_embd, bias=config.bias),
             )
         )
@@ -321,32 +303,49 @@ class GPT(nn.Module):
         return idx
 
 
+@dataclass
+class ProductGPTConfig(GPTConfig):
+    # Original GPT parameters
+    block_size: int = 1024
+    vocab_size: int = None  # Not needed for product recommendations
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    dropout: float = 0.0
+    bias: bool = True
+
+    # ProductGPT specific parameters
+    max_products: int = 100000  # This replaces vocab_size for our use case
+    max_users: int = 1000000
+    n_user_embd: int = 32  # Smaller embedding dimension for users
+    n_context_features: int = 5
+    pad_token: int = 0
+    anonymous_user_token: int = -1  # Special token for unknown users
+
+
 class ProductGPT(GPT):
     def __init__(self, config):
-        # Override vocab_size with max_products before parent initialization
         config.vocab_size = config.max_products + 1  # +1 for padding token
         super().__init__(config)
 
-        # User embeddings
+        # User embeddings (smaller dimension) + projection
         self.user_embedding = nn.Embedding(
             config.max_users + 1,  # +1 for anonymous user token
-            config.n_user_features,
+            config.n_user_embd,
             padding_idx=config.anonymous_user_token,
         )
+        self.user_proj = nn.Linear(config.n_user_embd, config.n_embd)
 
-        # Projection layers
-        self.user_proj = nn.Linear(config.n_user_features, config.n_embd)
+        # Projection layer for context only
         self.context_proj = nn.Linear(config.n_context_features, config.n_embd)
-        self.metadata_proj = nn.Linear(config.n_user_metadata, config.n_embd)
 
         # Attention weights for different input types
-        self.input_weights = nn.Parameter(torch.ones(3))  # user, context, metadata
+        self.input_weights = nn.Parameter(torch.ones(2))  # user, context
 
     def forward(
         self,
         context_features,
         user_id=None,
-        user_metadata=None,
         product_history=None,
         targets=None,
     ):
@@ -358,7 +357,7 @@ class ProductGPT(GPT):
 
         # 2. Process user information (if available)
         if user_id is not None:
-            user_emb = self.user_embedding(user_id)  # [batch, n_user_features]
+            user_emb = self.user_embedding(user_id)  # [batch, n_user_embd]
             user_emb = self.user_proj(user_emb)  # [batch, n_embd]
         else:
             # Use anonymous user embedding
@@ -368,13 +367,7 @@ class ProductGPT(GPT):
             user_emb = self.user_embedding(anonymous_ids)
             user_emb = self.user_proj(user_emb)
 
-        # 3. Process user metadata (if available)
-        if user_metadata is not None:
-            metadata_emb = self.metadata_proj(user_metadata)  # [batch, n_embd]
-        else:
-            metadata_emb = torch.zeros(batch_size, self.config.n_embd, device=device)
-
-        # 4. Process product history using GPT's token embedding
+        # 3. Process product history using GPT's token embedding
         if product_history is not None:
             prod_emb = self.transformer.wte(product_history)  # [batch, seq, n_embd]
             pos = torch.arange(0, seq_len, dtype=torch.long, device=device)
@@ -387,19 +380,15 @@ class ProductGPT(GPT):
                 torch.zeros(seq_len, dtype=torch.long, device=device)
             )
 
-        # 5. Combine all information
+        # 4. Combine all information
         weights = F.softmax(self.input_weights, dim=0)
 
-        # Expand user and metadata embeddings to match sequence length
+        # Expand user embeddings to match sequence length
         user_emb = user_emb.unsqueeze(1).expand(-1, seq_len, -1)  # [batch, seq, n_embd]
-        metadata_emb = metadata_emb.unsqueeze(1).expand(
-            -1, seq_len, -1
-        )  # [batch, seq, n_embd]
 
         combined_context = (
             weights[0] * user_emb  # [batch, seq, n_embd]
             + weights[1] * context_emb  # [batch, seq, n_embd]
-            + weights[2] * metadata_emb  # [batch, seq, n_embd]
         )
 
         # Final input to transformer
@@ -429,7 +418,6 @@ class ProductGPT(GPT):
         self,
         context_features,
         user_id=None,
-        user_metadata=None,
         product_history=None,
         top_k=5,
     ):
@@ -439,7 +427,6 @@ class ProductGPT(GPT):
             logits, _ = self.forward(
                 context_features=context_features,
                 user_id=user_id,
-                user_metadata=user_metadata,
                 product_history=product_history,
             )
             probs = F.softmax(logits.squeeze(), dim=-1)

@@ -4,6 +4,7 @@ Example usage:
 $ python train_recsys.py --batch_size=32 --block_size=50 --n_layer=6 --n_head=8
 """
 
+import argparse
 import logging
 import math
 import os
@@ -11,6 +12,8 @@ import time
 from contextlib import nullcontext
 
 import numpy as np
+
+np.random.seed(42)  # Initialize NumPy first
 import pandas as pd
 import torch
 from sklearn.model_selection import train_test_split
@@ -46,7 +49,7 @@ data_dir = os.path.join("data", dataset)
 # model
 n_layer = 6
 n_head = 8
-n_embd = 384
+n_embd = 256
 dropout = 0.1
 bias = True
 
@@ -78,22 +81,33 @@ compile = True
 
 class MovieLensDataset(Dataset):
     def __init__(self, data_dir, split="train"):
-        # Load ratings data (UserID::MovieID::Rating::Timestamp)
-        ratings_file = os.path.join(data_dir, "ratings.dat")
+        # Load ratings data
+        ratings_path = os.path.join(data_dir, "ratings.dat")
         self.ratings = pd.read_csv(
-            ratings_file,
+            ratings_path,
             sep="::",
             engine="python",
-            names=["userId", "movieId", "rating", "timestamp"],
+            names=["user_id", "movie_id", "rating", "timestamp"],
         )
 
-        # Create user and movie mappings from ratings file
+        # Create ID mappings
+        unique_users = sorted(self.ratings.user_id.unique())
+        unique_movies = sorted(self.ratings.movie_id.unique())
+
         self.user_id_map = {
-            id: i for i, id in enumerate(self.ratings["userId"].unique())
+            old_id: new_id for new_id, old_id in enumerate(unique_users)
         }
         self.movie_id_map = {
-            id: i for i, id in enumerate(self.ratings["movieId"].unique())
+            old_id: new_id for new_id, old_id in enumerate(unique_movies)
         }
+
+        # Create reverse mappings
+        self.user_id_map_reverse = {v: k for k, v in self.user_id_map.items()}
+        self.movie_id_map_reverse = {v: k for k, v in self.movie_id_map.items()}
+
+        # Convert IDs
+        self.ratings["user_id"] = self.ratings.user_id.map(self.user_id_map)
+        self.ratings["movie_id"] = self.ratings.movie_id.map(self.movie_id_map)
 
         # Sort by timestamp
         self.ratings = self.ratings.sort_values("timestamp")
@@ -103,19 +117,29 @@ class MovieLensDataset(Dataset):
         train_ratings = self.ratings[self.ratings["timestamp"] <= timestamp_threshold]
         val_ratings = self.ratings[self.ratings["timestamp"] > timestamp_threshold]
 
+        # Get movies that appear in training set
+        train_movies = set(train_ratings["movie_id"].unique())
+
+        # Filter validation to only include movies from training
+        val_ratings = val_ratings[val_ratings["movie_id"].isin(train_movies)]
+
+        logging.info(
+            f"Removed {len(self.ratings) - len(train_ratings) - len(val_ratings)} cold-start items from validation"
+        )
+
         # Group by user and create sequences
         ratings_to_use = train_ratings if split == "train" else val_ratings
-        user_sequences = ratings_to_use.groupby("userId")
+        user_sequences = ratings_to_use.groupby("user_id")
 
-        # Create sequences
+        # Create sequences (using already mapped IDs)
         self.sequences = []
         for user_id, group in user_sequences:
-            movies = [self.movie_id_map[m] for m in group["movieId"]]
+            movies = group["movie_id"].values  # Already mapped IDs
             ratings = group["rating"].values
             if len(movies) >= 3:  # Minimum sequence length
                 self.sequences.append(
                     (
-                        self.user_id_map[user_id],
+                        user_id,  # Already mapped user_id
                         movies,
                         ratings,
                         group["timestamp"].values,
@@ -141,11 +165,55 @@ class MovieLensDataset(Dataset):
                 ]
             )
 
+        # Load and process movie genres
+        movies_path = os.path.join(data_dir, "movies.dat")
+        movies_df = pd.read_csv(
+            movies_path,
+            sep="::",
+            engine="python",
+            encoding="ISO-8859-1",
+            names=["movie_id", "title", "genres"],
+        )
+
+        # Only consider genres from training movies
+        train_movies_original_ids = {
+            self.movie_id_map_reverse[movie_id] for movie_id in train_movies
+        }
+        train_movies_df = movies_df[
+            movies_df["movie_id"].isin(train_movies_original_ids)
+        ]
+
+        # Create genre vocabulary from training movies only
+        genres = set()
+        for g in train_movies_df.genres.str.split("|"):
+            genres.update(g)
+        self.genre_list = sorted(list(genres))
+        self.genre_to_idx = {genre: idx for idx, genre in enumerate(self.genre_list)}
+
+        # Create genre mapping for each movie (use primary genre)
+        self.movie_genres = {}
+        for (
+            _,
+            row,
+        ) in movies_df.iterrows():  # Process all movies but use training genres
+            primary_genre = row.genres.split("|")[0]
+            if primary_genre in self.genre_to_idx:  # Only use genres seen in training
+                self.movie_genres[row.movie_id] = self.genre_to_idx[primary_genre]
+            else:
+                self.movie_genres[row.movie_id] = 0  # Default genre for unseen genres
+
+        logging.info(f"Number of genres in training: {len(self.genre_list)}")
+
     def __len__(self):
         return len(self.sequences)
 
     def __getitem__(self, idx):
         user_id, movie_sequence, ratings, timestamps = self.sequences[idx]
+
+        # Convert to numpy arrays first
+        movie_sequence = np.array(movie_sequence)
+        ratings = np.array(ratings)
+        timestamps = np.array(timestamps)
 
         if len(movie_sequence) > block_size:
             # Take the most recent block_size items
@@ -155,7 +223,9 @@ class MovieLensDataset(Dataset):
         else:
             # Pad sequences
             pad_length = block_size - len(movie_sequence)
-            movie_sequence = [0] * pad_length + movie_sequence
+            movie_sequence = np.pad(
+                movie_sequence, (pad_length, 0), "constant", constant_values=0
+            )
             ratings = np.pad(ratings, (pad_length, 0), "constant", constant_values=0)
             timestamps = np.pad(timestamps, (pad_length, 0), "edge")
 
@@ -168,20 +238,26 @@ class MovieLensDataset(Dataset):
             [
                 np.concatenate(
                     [
-                        self.contexts[ts],
-                        [min(delta / 86400, 30.0)],  # Time delta in days, capped at 30
-                        [rating / 5.0],  # Normalize rating to 0-1
+                        self.contexts[ts],  # [4] time features
+                        [min(delta / 86400, 30.0)],  # [1] time delta in days
+                        [rating / 5.0],  # [1] normalized rating
+                        [
+                            self.movie_genres.get(  # [1] genre feature
+                                self.movie_id_map_reverse[movie_id],
+                                0,  # Convert back to original ID for genre lookup
+                            )
+                        ],
                     ]
                 )
-                for ts, delta, rating in zip(timestamps, time_deltas, ratings)
+                for ts, delta, rating, movie_id in zip(
+                    timestamps, time_deltas, ratings, movie_sequence
+                )
             ]
         )
 
-        # Make sure product_history and targets have the same sequence length
+        # Make sure sequences have the same length
         product_history = torch.tensor(movie_sequence[:-1], dtype=torch.long)
         targets = torch.tensor(movie_sequence[1:], dtype=torch.long)
-
-        # Pad context features to match sequence length
         context_features = torch.tensor(context_sequence[:-1], dtype=torch.float)
 
         return {
@@ -192,23 +268,31 @@ class MovieLensDataset(Dataset):
         }
 
 
-def create_dataloaders():
-    train_dataset = MovieLensDataset(data_dir, split="train")
-    val_dataset = MovieLensDataset(data_dir, split="val")
+def create_dataloaders(train_dataset):
+    # Create validation split
+    train_idx, val_idx = train_test_split(
+        range(len(train_dataset)), test_size=0.1, random_state=42
+    )
 
+    # Create subset datasets
+    train_subset = torch.utils.data.Subset(train_dataset, train_idx)
+    val_subset = torch.utils.data.Subset(train_dataset, val_idx)
+
+    # Create data loaders with reduced workers
     train_loader = DataLoader(
-        train_dataset,
+        train_subset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,  # Increase if needed
-        pin_memory=True if device == "cuda" else False,
+        num_workers=0,  # Reduced to 0 to avoid multiprocessing issues
+        pin_memory=True if torch.cuda.is_available() else False,
     )
+
     val_loader = DataLoader(
-        val_dataset,
+        val_subset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
-        pin_memory=True if device == "cuda" else False,
+        num_workers=0,  # Reduced to 0 to avoid multiprocessing issues
+        pin_memory=True if torch.cuda.is_available() else False,
     )
 
     return train_loader, val_loader
@@ -277,17 +361,45 @@ def evaluate(model, val_loader, ctx):
     }
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train ProductGPT")
+    parser.add_argument(
+        "--epochs", type=int, default=20, help="Number of epochs to train"
+    )
+    parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
+    parser.add_argument(
+        "--block_size", type=int, default=50, help="Maximum sequence length"
+    )
+    parser.add_argument(
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    return parser.parse_args()
+
+
 def main():
-    # Get number of products from dataset
+    args = parse_args()
+    global batch_size, block_size, device
+    batch_size = args.batch_size
+    block_size = args.block_size
+    device = args.device
+
+    # Get dataset stats
     train_dataset = MovieLensDataset(data_dir, split="train")
     n_products = len(train_dataset.movie_id_map)
     n_users = len(train_dataset.user_id_map)
+    n_genres = len(train_dataset.genre_list)
+
+    # Create dataloaders
+    train_loader, val_loader = create_dataloaders(train_dataset)
 
     logging.info(f"Dataset stats:")
     logging.info(f"  Users: {n_users}")
     logging.info(f"  Movies: {n_products}")
+    logging.info(f"  Genres: {n_genres}")
+    logging.info(f"Training for {args.epochs} epochs")
+    logging.info(f"Steps per epoch: {len(train_loader)}")
 
-    # Initialize model
+    # Initialize model with original context features + 1 for genre
     config = ProductGPTConfig(
         block_size=block_size,
         n_layer=n_layer,
@@ -295,21 +407,15 @@ def main():
         n_embd=n_embd,
         dropout=dropout,
         bias=bias,
-        # ProductGPT specific
         max_products=n_products,
         max_users=n_users,
-        n_context_features=6,  # 4 time features + time delta + rating
-        n_user_metadata=0,  # No user metadata available
+        n_context_features=7,  # original 6 + genre
+        pad_token=0,
         anonymous_user_token=-1,
     )
 
     model = ProductGPT(config)
     model.to(device)
-
-    # Create dataloaders
-    train_loader, val_loader = create_dataloaders()
-
-    # Set up training
     optimizer = model.configure_optimizers(
         weight_decay, learning_rate, (beta1, beta2), device
     )
@@ -319,77 +425,95 @@ def main():
         else torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
     )
 
-    if compile:
+    if compile and device == "cuda":
         print("Compiling model...")
         model = torch.compile(model)
 
-    logging.info(f"Starting training with device={device}, dtype={dtype}")
-
     # Training loop
     best_val_loss = float("inf")
-    progress_bar = tqdm(range(max_iters), desc="Training")
-    for iter_num in progress_bar:
-        t0 = time.time()
 
-        # Get batch and train
-        batch = get_batch("train", train_loader, val_loader)
-        batch = {k: v.to(device) for k, v in batch.items()}
+    for epoch in range(args.epochs):
+        model.train()
+        epoch_loss = 0.0
 
-        # Forward pass
-        with ctx:
-            logits, loss = model(
-                context_features=batch["context_features"],
-                user_id=batch["user_id"],
-                product_history=batch["product_history"],
-                targets=batch["targets"],
-            )
-
-        # Backward pass
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        if grad_clip != 0.0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
-
-        # Update progress bar with current metrics
-        progress_bar.set_postfix(
-            {"loss": f"{loss.item():.4f}", "iter/s": f"{1.0/((time.time()-t0)):.1f}"}
+        # Training
+        progress_bar = tqdm(
+            enumerate(train_loader),
+            total=len(train_loader),
+            desc=f"Epoch {epoch+1}/{args.epochs}",
         )
 
-        # Evaluation
-        if iter_num % eval_interval == 0:
-            train_metrics = evaluate(model, train_loader, ctx)
-            val_metrics = evaluate(model, val_loader, ctx)
+        for step, batch in progress_bar:
+            t0 = time.time()
+            batch = {k: v.to(device) for k, v in batch.items()}
 
-            logging.info(f"\nStep {iter_num} Metrics:")
-            logging.info("Training:")
-            logging.info(f"  Loss: {train_metrics['loss']:.4f}")
-            logging.info(f"  Hit@10: {train_metrics['hit_rate']:.4f}")
-            logging.info(f"  NDCG@10: {train_metrics['ndcg']:.4f}")
-            logging.info("Validation:")
-            logging.info(f"  Loss: {val_metrics['loss']:.4f}")
-            logging.info(f"  Hit@10: {val_metrics['hit_rate']:.4f}")
-            logging.info(f"  NDCG@10: {val_metrics['ndcg']:.4f}")
+            # Forward pass
+            with ctx:
+                logits, loss = model(
+                    context_features=batch["context_features"],
+                    user_id=batch["user_id"],
+                    product_history=batch["product_history"],
+                    targets=batch["targets"],
+                )
 
-            # Save checkpoint based on validation loss
-            if val_metrics["loss"] < best_val_loss:
-                best_val_loss = val_metrics["loss"]
-                checkpoint = {
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "config": config,
-                    "iter_num": iter_num,
-                    "metrics": {
-                        "train": train_metrics,
-                        "val": val_metrics,
-                    },
+            # Backward pass
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            if grad_clip != 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+
+            epoch_loss += loss.item()
+            progress_bar.set_postfix(
+                {
+                    "loss": f"{loss.item():.4f}",
+                    "avg_loss": f"{epoch_loss/(step+1):.4f}",
+                    "iter/s": f"{1.0/(time.time()-t0):.1f}",
                 }
-                logging.info(f"saving checkpoint to {out_dir}")
-                os.makedirs(out_dir, exist_ok=True)
-                torch.save(checkpoint, os.path.join(out_dir, "best_model.pt"))
+            )
+
+        # End of epoch evaluation
+        train_metrics = evaluate(model, train_loader, ctx)
+        val_metrics = evaluate(model, val_loader, ctx)
+
+        logging.info(f"\nEpoch {epoch+1} Summary:")
+        logging.info(f"Average training loss: {epoch_loss/len(train_loader):.4f}")
+        logging.info("Training Metrics:")
+        logging.info(f"  Loss: {train_metrics['loss']:.4f}")
+        logging.info(f"  Hit@10: {train_metrics['hit_rate']:.4f}")
+        logging.info(f"  NDCG@10: {train_metrics['ndcg']:.4f}")
+        logging.info("Validation Metrics:")
+        logging.info(f"  Loss: {val_metrics['loss']:.4f}")
+        logging.info(f"  Hit@10: {val_metrics['hit_rate']:.4f}")
+        logging.info(f"  NDCG@10: {val_metrics['ndcg']:.4f}")
+
+        # Save best model
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            checkpoint = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "config": config,
+                "epoch": epoch,
+                "metrics": {
+                    "train": train_metrics,
+                    "val": val_metrics,
+                },
+            }
+            logging.info(f"saving checkpoint to {out_dir}")
+            os.makedirs(out_dir, exist_ok=True)
+            torch.save(checkpoint, os.path.join(out_dir, "best_model.pt"))
 
 
 if __name__ == "__main__":
+    # Add multiprocessing start method
+    import multiprocessing
+
+    try:
+        multiprocessing.set_start_method("spawn")
+    except RuntimeError:
+        pass
+
     try:
         main()
     except Exception as e:
