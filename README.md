@@ -32,16 +32,13 @@ The code automatically uses MPS (Metal Performance Shaders) on Apple Silicon:
 
 ## Dataset
 
-Currently supports MovieLens-1M dataset. Download and place the data files:
+Currently supports MovieLens-1M dataset.
 
 ```
 data/
   movielens-1m/
     ratings.dat
 ```
-
-The ratings.dat file should use the format:
-- UserID::MovieID::Rating::Timestamp
 
 ## Training
 
