@@ -6,7 +6,6 @@ $ python train_recsys.py --batch_size=32 --block_size=50 --n_layer=6 --n_head=8
 
 import argparse
 import logging
-import math
 import os
 import time
 from contextlib import nullcontext
@@ -17,8 +16,6 @@ np.random.seed(42)  # Initialize NumPy first
 import pandas as pd
 import torch
 from sklearn.model_selection import train_test_split
-from torch.distributed import destroy_process_group, init_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -90,23 +87,14 @@ class MovieLensDataset(Dataset):
             names=["user_id", "movie_id", "rating", "timestamp"],
         )
 
-        # Create ID mappings
-        unique_users = sorted(self.ratings.user_id.unique())
+        # Create movie ID mapping only
         unique_movies = sorted(self.ratings.movie_id.unique())
-
-        self.user_id_map = {
-            old_id: new_id for new_id, old_id in enumerate(unique_users)
-        }
         self.movie_id_map = {
             old_id: new_id for new_id, old_id in enumerate(unique_movies)
         }
-
-        # Create reverse mappings
-        self.user_id_map_reverse = {v: k for k, v in self.user_id_map.items()}
         self.movie_id_map_reverse = {v: k for k, v in self.movie_id_map.items()}
 
-        # Convert IDs
-        self.ratings["user_id"] = self.ratings.user_id.map(self.user_id_map)
+        # Convert movie IDs
         self.ratings["movie_id"] = self.ratings.movie_id.map(self.movie_id_map)
 
         # Sort by timestamp
@@ -131,15 +119,14 @@ class MovieLensDataset(Dataset):
         ratings_to_use = train_ratings if split == "train" else val_ratings
         user_sequences = ratings_to_use.groupby("user_id")
 
-        # Create sequences (using already mapped IDs)
+        # Create sequences
         self.sequences = []
-        for user_id, group in user_sequences:
-            movies = group["movie_id"].values  # Already mapped IDs
+        for _, group in user_sequences:
+            movies = group["movie_id"].values
             ratings = group["rating"].values
             if len(movies) >= 3:  # Minimum sequence length
                 self.sequences.append(
                     (
-                        user_id,  # Already mapped user_id
                         movies,
                         ratings,
                         group["timestamp"].values,
@@ -147,7 +134,6 @@ class MovieLensDataset(Dataset):
                 )
 
         logging.info(f"Loaded {len(self.sequences)} sequences for {split}")
-        logging.info(f"Number of users: {len(self.user_id_map)}")
         logging.info(f"Number of movies: {len(self.movie_id_map)}")
 
         # Create context features for all timestamps
@@ -192,12 +178,9 @@ class MovieLensDataset(Dataset):
 
         # Create genre mapping for each movie (use primary genre)
         self.movie_genres = {}
-        for (
-            _,
-            row,
-        ) in movies_df.iterrows():  # Process all movies but use training genres
+        for _, row in movies_df.iterrows():
             primary_genre = row.genres.split("|")[0]
-            if primary_genre in self.genre_to_idx:  # Only use genres seen in training
+            if primary_genre in self.genre_to_idx:
                 self.movie_genres[row.movie_id] = self.genre_to_idx[primary_genre]
             else:
                 self.movie_genres[row.movie_id] = 0  # Default genre for unseen genres
@@ -208,7 +191,7 @@ class MovieLensDataset(Dataset):
         return len(self.sequences)
 
     def __getitem__(self, idx):
-        user_id, movie_sequence, ratings, timestamps = self.sequences[idx]
+        movie_sequence, ratings, timestamps = self.sequences[idx]
 
         # Convert to numpy arrays first
         movie_sequence = np.array(movie_sequence)
@@ -240,7 +223,9 @@ class MovieLensDataset(Dataset):
                     [
                         self.contexts[ts],  # [4] time features
                         [min(delta / 86400, 30.0)],  # [1] time delta in days
-                        [rating / 5.0],  # [1] normalized rating
+                        [
+                            (rating - 3.0) / 2.0
+                        ],  # [1] normalized rating: maps 1->-1, 3->0, 5->1
                         [
                             self.movie_genres.get(  # [1] genre feature
                                 self.movie_id_map_reverse[movie_id],
@@ -261,7 +246,6 @@ class MovieLensDataset(Dataset):
         context_features = torch.tensor(context_sequence[:-1], dtype=torch.float)
 
         return {
-            "user_id": torch.tensor(user_id, dtype=torch.long),
             "context_features": context_features,
             "product_history": product_history,
             "targets": targets,
@@ -320,7 +304,6 @@ def evaluate(model, val_loader, ctx):
         with ctx:
             logits, loss = model(
                 context_features=batch["context_features"],
-                user_id=batch["user_id"],
                 product_history=batch["product_history"],
                 targets=batch["targets"],
             )
@@ -386,14 +369,12 @@ def main():
     # Get dataset stats
     train_dataset = MovieLensDataset(data_dir, split="train")
     n_products = len(train_dataset.movie_id_map)
-    n_users = len(train_dataset.user_id_map)
     n_genres = len(train_dataset.genre_list)
 
     # Create dataloaders
     train_loader, val_loader = create_dataloaders(train_dataset)
 
     logging.info(f"Dataset stats:")
-    logging.info(f"  Users: {n_users}")
     logging.info(f"  Movies: {n_products}")
     logging.info(f"  Genres: {n_genres}")
     logging.info(f"Training for {args.epochs} epochs")
@@ -408,10 +389,8 @@ def main():
         dropout=dropout,
         bias=bias,
         max_products=n_products,
-        max_users=n_users,
-        n_context_features=7,  # original 6 + genre
+        n_context_features=7,  # Time features (4) + time delta + rating + genre
         pad_token=0,
-        anonymous_user_token=-1,
     )
 
     model = ProductGPT(config)
@@ -451,7 +430,6 @@ def main():
             with ctx:
                 logits, loss = model(
                     context_features=batch["context_features"],
-                    user_id=batch["user_id"],
                     product_history=batch["product_history"],
                     targets=batch["targets"],
                 )
@@ -500,22 +478,14 @@ def main():
                     "val": val_metrics,
                 },
             }
-            logging.info(f"saving checkpoint to {out_dir}")
             os.makedirs(out_dir, exist_ok=True)
             torch.save(checkpoint, os.path.join(out_dir, "best_model.pt"))
+            logging.info("Saved new best model!")
 
 
 if __name__ == "__main__":
-    # Add multiprocessing start method
-    import multiprocessing
-
-    try:
-        multiprocessing.set_start_method("spawn")
-    except RuntimeError:
-        pass
-
     try:
         main()
     except Exception as e:
-        logging.error(f"Training failed with error: {str(e)}", exc_info=True)
+        logging.error(f"Training failed with error: {str(e)}")
         raise

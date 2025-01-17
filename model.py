@@ -315,12 +315,9 @@ class ProductGPTConfig(GPTConfig):
     bias: bool = True
 
     # ProductGPT specific parameters
-    max_products: int = 100000  # This replaces vocab_size for our use case
-    max_users: int = 1000000
-    n_user_embd: int = 32  # Smaller embedding dimension for users
-    n_context_features: int = 5
+    max_products: int = 3706  # Number of movies in the dataset
+    n_context_features: int = 7  # Time features (4) + time delta + rating + genre
     pad_token: int = 0
-    anonymous_user_token: int = -1  # Special token for unknown users
 
 
 class ProductGPT(GPT):
@@ -328,24 +325,12 @@ class ProductGPT(GPT):
         config.vocab_size = config.max_products + 1  # +1 for padding token
         super().__init__(config)
 
-        # User embeddings (smaller dimension) + projection
-        self.user_embedding = nn.Embedding(
-            config.max_users + 1,  # +1 for anonymous user token
-            config.n_user_embd,
-            padding_idx=config.anonymous_user_token,
-        )
-        self.user_proj = nn.Linear(config.n_user_embd, config.n_embd)
-
-        # Projection layer for context only
+        # Projection layer for context features
         self.context_proj = nn.Linear(config.n_context_features, config.n_embd)
-
-        # Attention weights for different input types
-        self.input_weights = nn.Parameter(torch.ones(2))  # user, context
 
     def forward(
         self,
         context_features,
-        user_id=None,
         product_history=None,
         targets=None,
     ):
@@ -355,19 +340,7 @@ class ProductGPT(GPT):
         # 1. Process context features
         context_emb = self.context_proj(context_features)  # [batch, seq, n_embd]
 
-        # 2. Process user information (if available)
-        if user_id is not None:
-            user_emb = self.user_embedding(user_id)  # [batch, n_user_embd]
-            user_emb = self.user_proj(user_emb)  # [batch, n_embd]
-        else:
-            # Use anonymous user embedding
-            anonymous_ids = torch.full(
-                (batch_size,), self.config.anonymous_user_token, device=device
-            )
-            user_emb = self.user_embedding(anonymous_ids)
-            user_emb = self.user_proj(user_emb)
-
-        # 3. Process product history using GPT's token embedding
+        # 2. Process product history using GPT's token embedding
         if product_history is not None:
             prod_emb = self.transformer.wte(product_history)  # [batch, seq, n_embd]
             pos = torch.arange(0, seq_len, dtype=torch.long, device=device)
@@ -380,19 +353,8 @@ class ProductGPT(GPT):
                 torch.zeros(seq_len, dtype=torch.long, device=device)
             )
 
-        # 4. Combine all information
-        weights = F.softmax(self.input_weights, dim=0)
-
-        # Expand user embeddings to match sequence length
-        user_emb = user_emb.unsqueeze(1).expand(-1, seq_len, -1)  # [batch, seq, n_embd]
-
-        combined_context = (
-            weights[0] * user_emb  # [batch, seq, n_embd]
-            + weights[1] * context_emb  # [batch, seq, n_embd]
-        )
-
         # Final input to transformer
-        x = prod_emb + pos_emb.unsqueeze(0) + combined_context  # [batch, seq, n_embd]
+        x = prod_emb + pos_emb.unsqueeze(0) + context_emb  # [batch, seq, n_embd]
 
         # Forward through transformer
         x = self.transformer.drop(x)
@@ -417,19 +379,29 @@ class ProductGPT(GPT):
     def get_recommendations(
         self,
         context_features,
-        user_id=None,
         product_history=None,
         top_k=5,
     ):
         """Get recommendations handling all cold start scenarios"""
         self.eval()
+        device = context_features.device
+
+        # Ensure product history is on correct device
+        if product_history is not None:
+            product_history = product_history.to(device)
+            assert (product_history >= 0).all() and (
+                product_history < self.config.max_products
+            ).all(), f"Product IDs must be in range [0, {self.config.max_products})"
+
         with torch.no_grad():
             logits, _ = self.forward(
                 context_features=context_features,
-                user_id=user_id,
                 product_history=product_history,
             )
-            probs = F.softmax(logits.squeeze(), dim=-1)
+            # Ensure we're working with the last prediction for each sequence
+            if logits.dim() == 3:
+                logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
             top_probs, top_products = torch.topk(probs, k=top_k)
 
         return top_products, top_probs
